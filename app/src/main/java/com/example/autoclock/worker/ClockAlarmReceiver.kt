@@ -47,10 +47,11 @@ class ClockAlarmReceiver : BroadcastReceiver() {
         }
 
         // 2. 通过静态变量传递任务信息给无障碍服务
-        //    （虽然用静态变量，但闹钟触发时服务如果已开启就不会被杀）
+        //    注意：不调用 resetState()，因为它会清空 pendingTaskId 和 pendingAction
         AutoClockAccessibilityService.pendingTaskId = taskId
         AutoClockAccessibilityService.pendingAction = action
-        AutoClockAccessibilityService.instance?.resetState()
+        // 通知服务开始打卡流程（重置内部标志，启动轮询）
+        AutoClockAccessibilityService.instance?.onTaskStart()
 
         // 3. 启动钉钉 App
         try {
