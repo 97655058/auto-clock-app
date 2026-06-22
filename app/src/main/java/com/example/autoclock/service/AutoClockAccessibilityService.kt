@@ -93,7 +93,7 @@ class AutoClockAccessibilityService : AccessibilityService() {
     /**
      * 主轮询 Runnable：按当前阶段执行对应逻辑
      */
-    private val pollRunnable = object : Runnable {
+    private val pollRunnable: Runnable = object : Runnable {
         override fun run() {
             if (pendingTaskId == -1L || pendingAction == null) {
                 Log.d(TAG, "poll: 无任务，停止")
