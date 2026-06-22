@@ -23,6 +23,17 @@
     <!-- 唤醒锁（WorkManager 内部使用） -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!-- Android 11+ 包可见性：声明需要与钉钉交互 -->
+    <queries>
+        <!-- 查询钉钉是否已安装，获取启动 Intent -->
+        <package android:name="com.alibaba.android.rimet" />
+        <!-- 通过 Intent 方式查询（兜底） -->
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
     <application
         android:name=".AutoClockApplication"
         android:allowBackup="true"
