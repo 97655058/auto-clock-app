@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">自动打卡助手</string>
+    <string name="title_task_edit">编辑任务</string>
+    <string name="title_permission_guide">权限设置</string>
+    <string name="accessibility_service_label">自动打卡无障碍服务</string>
+    <string name="accessibility_service_desc">用于识别钉钉考勤界面并自动执行打卡操作，不读取任何隐私信息。</string>
+</resources>
