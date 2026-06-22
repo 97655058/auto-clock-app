@@ -15,16 +15,28 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 
 /**
- * 自动打卡无障碍服务
+ * 自动打卡无障碍服务 — 基于用户提供的钉钉真实截图重写
  *
- * 采用轮询式状态机设计：
- * 1. ClockAlarmReceiver 设置 pendingTaskId/pendingAction 后调用 onTaskStart()
- * 2. 服务启动轮询，每2秒检查当前页面
- * 3. 按优先级尝试：打卡按钮 > 考勤入口 > 工作台tab
- * 4. 最多重试15次（30秒），超时发送失败通知
+ * ═══════════════════════ 钉钉实际界面结构 ═════════════════════════
  *
- * 钉钉打卡流程：
- * 消息页 → 点"工作"tab → 工作台页 → 点"考勤打卡" → 考勤页 → 点"上班/下班打卡" → 完成
+ * 【消息首页】（DingTalk 启动后默认显示）
+ *   顶部导航栏：日历 | 待办 | DING | ☐ **打卡** | 通话   ← 目标1：点这个"打卡"
+ *   下方：聊天列表...
+ *
+ * 【考勤页面】（点击顶部"打卡"后进入）
+ *   标题栏：< 公司名 ...
+ *   卡片区：上班08:30(✓已打卡) | 下班12:00(✓已打卡) | 上班13:30(✓已打卡)
+ *   中间大蓝按钮：**"上班打卡"** / **"下班打卡"**          ← 目标2：点这个完成
+ *   底部 tab：打卡 | 统计 | 设置
+ *
+ * ═════════════════════════ 两步打卡流程 ═════════════════════════
+ *
+ *  Phase 0 → 等待钉钉启动，rootInActiveWindow 可用
+ *  Phase 1 → 在首页找顶部导航栏的"打卡"按钮并点击
+ *  Phase 2 → 考勤页加载完毕，找中间的大蓝色"上班打卡"/"下班打卡"按钮并点击
+ *  Done    → 发通知、回桌面、重置状态
+ *
+ * ═════════════════════════ 关键词定义（来自真实截图） ════════════════
  */
 class AutoClockAccessibilityService : AccessibilityService() {
 
@@ -42,292 +54,351 @@ class AutoClockAccessibilityService : AccessibilityService() {
 
         const val DINGTALK_PACKAGE = "com.alibaba.android.rimet"
 
-        // 工作台 tab 关键词（钉钉底部导航栏）
-        private val WORK_TAB_KEYWORDS = listOf("工作", "工作台")
+        // ── 第1步：首页导航栏的"打卡"入口 ──
+        // 截图显示：日历 | 待办 | DING | ☐ 打卡 | 通话
+        // 这个"打卡"文字在顶部导航栏，点击后跳转到考勤页面
+        private val NAV_CLOCK_ENTRY = listOf("打卡")
 
-        // 考勤打卡入口关键词（工作台页面的应用图标）
-        private val ATTENDANCE_ENTRY_KEYWORDS = listOf("考勤打卡", "考勤", "打卡")
+        // ── 第2步：考勤页面的实际打卡按钮 ──
+        // 截图显示：中间大蓝圆形按钮，文字为 "上班打卡" 或 "下班打卡"
+        // 注意：底部也有一个"打卡"tab，需要排除（通过位置/上下文区分）
+        private val CLOCK_IN_BUTTONS = listOf("上班打卡")
+        private val CLOCK_OUT_BUTTONS = listOf("下班打卡")
 
-        // 上班打卡按钮关键词
-        private val CLOCK_IN_KEYWORDS = listOf("上班打卡", "上班签到", "签到打卡", "上班", "签到")
+        // ── 兜底关键词：有些公司可能显示不同文字 ──
+        private val CLOCK_IN_FALLBACK = listOf("上班打卡", "签到", "上班签到")
+        private val CLOCK_OUT_FALLBACK = listOf("下班打卡", "签退", "下班签退")
 
-        // 下班打卡按钮关键词
-        private val CLOCK_OUT_KEYWORDS = listOf("下班打卡", "下班签退", "签退打卡", "下班", "签退")
+        /** 当前阶段 */
+        const val PHASE_WAIT_APP = 0     // 等待钉钉启动
+        const val PHASE_CLICK_NAV = 1    // 已启动，需要点顶部"打卡"导航
+        const val PHASE_CLICK_PUNCH = 2  // 已进入考勤页，需要点实际的打卡按钮
+        const val PHASE_DONE = 3         // 完成
     }
 
     private val handler = Handler(Looper.getMainLooper())
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
-    private var hasClickedClockButton = false
-    private var hasNavigatedToWorkTab = false
-    private var hasNavigatedToAttendance = false
+    /** 当前处于哪个阶段 */
+    @Volatile
+    private var currentPhase = PHASE_WAIT_APP
+
     private var retryCount = 0
-    private val maxRetries = 15
-    private val pollInterval = 2000L
-    private val initialDelay = 3000L
-    private val successDelay = 3000L
+    private val maxRetries = 20           // 最大轮询次数（每2秒一次 ≈ 40秒超时）
+    private val pollInterval = 2000L      // 每2秒轮询一次
+    private val initialDelay = 4000L      // 首次延迟4秒等钉钉加载
+    private val phaseTransitionDelay = 3000L  // 阶段切换后等待页面加载
+    private val successDelay = 2000L      // 点击成功后延迟确认
 
     /**
-     * 轮询 Runnable：每2秒检查当前页面，按优先级尝试点击
+     * 主轮询 Runnable：按当前阶段执行对应逻辑
      */
     private val pollRunnable = object : Runnable {
         override fun run() {
             if (pendingTaskId == -1L || pendingAction == null) {
-                Log.d(TAG, "pollRunnable: 无待执行任务，停止轮询")
+                Log.d(TAG, "poll: 无任务，停止")
                 return
             }
-            if (hasClickedClockButton) {
-                Log.d(TAG, "pollRunnable: 已点击打卡按钮，停止轮询")
+            if (currentPhase >= PHASE_DONE) {
+                Log.d(TAG, "poll: 已完成，停止")
                 return
             }
             if (retryCount >= maxRetries) {
-                Log.w(TAG, "pollRunnable: 重试${retryCount}次仍未完成，超时")
-                onClockFail("超时未找到打卡按钮，请检查钉钉页面")
+                Log.w(TAG, "poll: 重试${retryCount}次超时，currentPhase=$currentPhase")
+                onClockFail("超时（第${currentPhase}阶段未完成），请检查钉钉是否在前台")
                 return
             }
 
             retryCount++
-            Log.d(TAG, "pollRunnable: 第${retryCount}/${maxRetries}次轮询")
+            Log.d(TAG, "poll: #$retryCount/$maxRetries | phase=$currentPhase | action=$pendingAction")
 
             val root = rootInActiveWindow
             if (root == null) {
-                Log.d(TAG, "pollRunnable: rootInActiveWindow 为空，等待下次")
-                handler.postDelayed(this, pollInterval)
+                Log.d(TAG, "poll: root为空，等待钉钉窗口")
+                scheduleNext()
                 return
             }
 
             try {
-                executeClockFlow(root)
+                executeCurrentPhase(root)
             } catch (e: Exception) {
-                Log.e(TAG, "pollRunnable: 执行异常", e)
+                Log.e(TAG, "poll: 异常", e)
             } finally {
                 root.recycle()
             }
 
-            if (!hasClickedClockButton) {
-                handler.postDelayed(this, pollInterval)
+            if (currentPhase < PHASE_DONE) {
+                scheduleNext()
             }
+        }
+
+        private fun scheduleNext() {
+            handler.postDelayed(pollRunnable, pollInterval)
         }
     }
 
     /**
-     * 被 ClockAlarmReceiver 调用，通知服务开始新的打卡任务
-     * 重置内部导航标志，启动轮询定时器
+     * 根据当前阶段执行对应的操作
      */
-    fun onTaskStart() {
-        Log.i(TAG, "onTaskStart: 开始打卡流程, action=$pendingAction")
-        hasClickedClockButton = false
-        hasNavigatedToWorkTab = false
-        hasNavigatedToAttendance = false
-        retryCount = 0
-        handler.removeCallbacks(pollRunnable)
-        // 延迟3秒后开始轮询，等钉钉完全启动
-        handler.postDelayed(pollRunnable, initialDelay)
-    }
+    private fun executeCurrentPhase(root: AccessibilityNodeInfo) {
+        when (currentPhase) {
+            PHASE_WAIT_APP -> {
+                // 检查是否已经在钉钉界面了
+                val pkg = root.packageName?.toString() ?: ""
+                if (pkg == DINGTALK_PACKAGE || pkg.contains("dingtalk", true) || pkg.contains("rimet")) {
+                    Log.i(TAG, "检测到钉钉已打开，进入 Phase 1")
+                    transitionTo(PHASE_CLICK_NAV)
+                    // 立即尝试执行 Phase 1
+                    executeCurrentPhase(root)
+                } else {
+                    Log.d(TAG, "等待钉钉打开... 当前包名=$pkg")
+                }
+            }
 
-    override fun onServiceConnected() {
-        super.onServiceConnected()
-        instance = this
-        Log.i(TAG, "onServiceConnected: 无障碍服务已连接")
-    }
+            PHASE_CLICK_NAV -> {
+                // 在首页找顶部导航栏的"打卡"按钮
+                if (tryClickNavClockButton(root)) {
+                    Log.i(TAG, ">>> 已点击导航栏「打卡」，进入 Phase 2")
+                    transitionTo(PHASE_CLICK_PUNCH)
+                    // 重置重试计数，给新阶段更多时间
+                    retryCount = 0
+                } else {
+                    Log.d(TAG, "Phase 1: 未找到导航栏「打卡」按钮，继续查找...")
+                    dumpPageInfo(root)
+                }
+            }
 
-    override fun onUnbind(intent: Intent?): Boolean {
-        instance = null
-        handler.removeCallbacks(pollRunnable)
-        Log.i(TAG, "onUnbind: 无障碍服务已断开")
-        return super.onUnbind(intent)
-    }
-
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        event ?: return
-        if (pendingTaskId == -1L || pendingAction == null) return
-        if (hasClickedClockButton) return
-
-        val packageName = event.packageName?.toString() ?: return
-        if (packageName != DINGTALK_PACKAGE) return
-
-        // 收到钉钉窗口事件时，提前触发一次轮询（不打断已有的定时轮询）
-        when (event.eventType) {
-            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
-            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
-                handler.removeCallbacks(pollRunnable)
-                handler.post(pollRunnable)
+            PHASE_CLICK_PUNCH -> {
+                // 在考勤页找实际的打卡按钮（"上班打卡"/"下班打卡"）
+                if (tryClickPunchButton(root)) {
+                    Log.i(TAG, ">>> 已点击打卡按钮！完成！")
+                    transitionTo(PHASE_DONE)
+                    val label = when (pendingAction) {
+                        ClockAction.CLOCK_IN -> "上班打卡"
+                        ClockAction.CLOCK_OUT -> "下班打卡"
+                        null -> "打卡"
+                    }
+                    handler.postDelayed({ onClockSuccess(label) }, successDelay)
+                } else {
+                    Log.d(TAG, "Phase 2: 未找到打卡按钮，继续查找...")
+                }
             }
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    //  Phase 1：点击首页导航栏的「打卡」入口
+    // ═══════════════════════════════════════════════════════════════
+
     /**
-     * 执行打卡流程 - 按优先级尝试
+     * 在钉钉首页顶部导航栏中找到"打卡"按钮并点击
      *
-     * 优先级：打卡按钮 > 考勤入口 > 工作台tab
-     * 这样即使已经到了考勤页面，也不会重复点工作台
+     * 导航栏结构（从截图）：日历 | 待办 | DING | ☐ 打卡 | 通话
+     *
+     * 策略：
+     * 1. 用 findAccessibilityNodeInfosByText("打卡") 找所有包含该文字的节点
+     * 2. 排除底部 tab 的"打卡"（考勤页面底部的 tab 文字也是"打卡"）
+     * 3. 排除已经包含"上班"/"下班"的节点（那是真正的打卡按钮不是导航入口）
+     * 4. 找到可点击的父节点并执行点击
      */
-    private fun executeClockFlow(root: AccessibilityNodeInfo) {
-        // 1. 最高优先级：尝试直接点击打卡按钮
-        if (tryClickClockButton(root)) return
-
-        // 2. 尝试点击考勤打卡入口（如果还没进入考勤页）
-        if (!hasNavigatedToAttendance && tryClickAttendanceEntry(root)) {
-            hasNavigatedToAttendance = true
-            Log.i(TAG, "executeClockFlow: 已点击考勤入口，等待考勤页加载")
-            return
+    private fun tryClickNavClockButton(root: AccessibilityNodeInfo): Boolean {
+        val nodes = root.findAccessibilityNodeInfosByText("打卡")
+        if (nodes.isEmpty()) {
+            Log.d(TAG, "tryClickNavClockButton: 未找到任何含'打卡'的节点")
+            return false
         }
 
-        // 3. 尝试点击工作台 tab（如果还没进入工作台）
-        if (!hasNavigatedToWorkTab && tryClickWorkTab(root)) {
-            hasNavigatedToWorkTab = true
-            Log.i(TAG, "executeClockFlow: 已点击工作台tab，等待页面加载")
-            return
-        }
+        Log.d(TAG, "tryClickNavClockButton: 找到 ${nodes.size} 个含'打卡'的节点，逐一检查...")
 
-        // 4. 如果已经点了考勤入口但还没找到打卡按钮，可能是页面还在加载
-        if (hasNavigatedToAttendance) {
-            Log.d(TAG, "executeClockFlow: 已进入考勤页，等待打卡按钮出现...")
-        } else if (hasNavigatedToWorkTab) {
-            Log.d(TAG, "executeClockFlow: 已进入工作台，等待考勤入口出现...")
-        } else {
-            Log.d(TAG, "executeClockFlow: 等待钉钉首页加载...")
-        }
-    }
+        for (node in nodes) {
+            try {
+                val nodeText = node.text?.toString()?.trim() ?: ""
+                val desc = node.contentDescription?.toString()?.trim() ?: ""
+                val viewId = node.viewIdResourceName ?: ""
 
-    /**
-     * 尝试点击底部"工作"/"工作台"tab
-     */
-    private fun tryClickWorkTab(root: AccessibilityNodeInfo): Boolean {
-        for (keyword in WORK_TAB_KEYWORDS) {
-            val nodes = root.findAccessibilityNodeInfosByText(keyword)
-            for (node in nodes) {
-                try {
-                    val clickTarget = findClickableParent(node, 8) ?: node
-                    if (clickTarget.isClickable || clickTarget.isEnabled) {
-                        // 排除：如果这个节点文字也包含"考勤打卡"等，说明不是tab
-                        val nodeText = node.text?.toString() ?: ""
-                        if (ATTENDANCE_ENTRY_KEYWORDS.any { nodeText.contains(it) }) {
-                            continue
-                        }
-                        clickTarget.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                        Log.i(TAG, "tryClickWorkTab: 点击了 [$keyword] tab")
-                        return true
-                    }
-                } finally {
-                    node.recycle()
+                Log.d(TAG, "  节点: text='$nodeText' desc='$desc' id='$viewId' clickable=${node.isClickable}")
+
+                // 排除规则：
+                // 1. 排除真正的打卡按钮（"上班打卡"/"下班打卡" 包含"打卡"但不是导航入口）
+                if (CLOCK_IN_BUTTONS.any { nodeText == it } ||
+                    CLOCK_OUT_BUTTONS.any { nodeText == it }) {
+                    Log.d(TAG, "  → 排除：这是打卡按钮本身，不是导航入口")
+                    continue
                 }
+                if (CLOCK_IN_FALLBACK.any { nodeText.contains(it) } ||
+                    CLOCK_OUT_FALLBACK.any { nodeText.contains(it) }) {
+                    continue
+                }
+
+                // 2. 排除底部 tab 区域的节点（通常在屏幕底部 y > 90%）
+                val bounds = android.graphics.Rect()
+                node.getBoundsInScreen(bounds)
+                val screenHeight = resources.displayMetrics.heightPixels
+                if (bounds.bottom > screenHeight * 0.85f) {
+                    Log.d(TAG, "  → 排除：位于屏幕底部(${bounds.bottom}/${screenHeight})，可能是底部tab")
+                    continue
+                }
+
+                // 3. 找到可点击的父节点并点击
+                val target = findClickableParent(node, 6) ?: node
+                if (target.isClickable || node.isClickable) {
+                    val clickTarget = if (node.isClickable) node else target
+                    clickTarget.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    Log.i(TAG, "  ✓ 成功点击导航栏「打卡」! text='$nodeText'")
+                    return true
+                } else {
+                    Log.d(TAG, "  → 不可点击，尝试 ACTION_CLICK 直接点")
+                    node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    Log.i(TAG, "  ✓ 强制点击导航栏「打卡」! text='$nodeText'")
+                    return true
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "  节点处理异常", e)
+            } finally {
+                node.recycle()
             }
         }
+
         return false
     }
 
-    /**
-     * 尝试点击"考勤打卡"入口图标
-     */
-    private fun tryClickAttendanceEntry(root: AccessibilityNodeInfo): Boolean {
-        for (keyword in ATTENDANCE_ENTRY_KEYWORDS) {
-            val nodes = root.findAccessibilityNodeInfosByText(keyword)
-            for (node in nodes) {
-                try {
-                    val nodeText = node.text?.toString() ?: ""
-                    // 排除打卡按钮本身（"上班打卡"包含"打卡"，但不是入口）
-                    if (CLOCK_IN_KEYWORDS.any { nodeText.contains(it) } ||
-                        CLOCK_OUT_KEYWORDS.any { nodeText.contains(it) }
-                    ) {
-                        continue
-                    }
-
-                    val clickTarget = findClickableParent(node, 8) ?: node
-                    if (clickTarget.isClickable || clickTarget.isEnabled) {
-                        clickTarget.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                        Log.i(TAG, "tryClickAttendanceEntry: 点击了 [$keyword] 入口")
-                        return true
-                    }
-                } finally {
-                    node.recycle()
-                }
-            }
-        }
-        return false
-    }
+    // ═══════════════════════════════════════════════════════════════
+    //  Phase 2：点击考勤页面中间的大蓝色「上班打卡/下班打卡」按钮
+    // ═══════════════════════════════════════════════════════════════
 
     /**
-     * 尝试点击打卡按钮（上班/下班）
+     * 在考勤页面中找到实际的打卡按钮并点击
+     *
+     * 从截图看，这是一个大的蓝色圆形区域，文字为 "上班打卡" 或 "下班打卡"
+     * 位于页面中央偏下的位置
      */
-    private fun tryClickClockButton(root: AccessibilityNodeInfo): Boolean {
-        val keywords = when (pendingAction) {
-            ClockAction.CLOCK_IN -> CLOCK_IN_KEYWORDS
-            ClockAction.CLOCK_OUT -> CLOCK_OUT_KEYWORDS
-            null -> return false
-        }
+    private fun tryClickPunchButton(root: AccessibilityNodeInfo): Boolean {
+        val action = pendingAction ?: return false
 
-        val actionLabel = when (pendingAction) {
+        // 根据动作类型确定要搜索的关键词列表（优先精确匹配，再兜底）
+        val primaryKeywords = when (action) {
+            ClockAction.CLOCK_IN -> CLOCK_IN_BUTTONS
+            ClockAction.CLOCK_OUT -> CLOCK_OUT_BUTTONS
+        }
+        val fallbackKeywords = when (action) {
+            ClockAction.CLOCK_IN -> CLOCK_IN_FALLBACK
+            ClockAction.CLOCK_OUT -> CLOCK_OUT_FALLBACK
+        }
+        val actionLabel = when (action) {
             ClockAction.CLOCK_IN -> "上班打卡"
             ClockAction.CLOCK_OUT -> "下班打卡"
-            null -> return false
         }
 
-        // 方式1：通过文本查找
+        // 方式1：精确文本匹配
+        if (tryClickByText(root, primaryKeywords, actionLabel)) return true
+
+        // 方式2：兜底关键词
+        if (tryClickByText(root, fallbackKeywords, actionLabel)) return true
+
+        // 方式3：遍历整个节点树，用 contentDescription 匹配
+        if (tryClickByTreeTraversal(root, primaryKeywords + fallbackKeywords, actionLabel)) return true
+
+        Log.d(TAG, "tryClickPunchButton: 未找到打卡按钮, action=$action")
+        return false
+    }
+
+    /**
+     * 通过文本搜索找到打卡按钮并点击
+     */
+    private fun tryClickByText(
+        root: AccessibilityNodeInfo,
+        keywords: List<String>,
+        actionLabel: String
+    ): Boolean {
         for (keyword in keywords) {
             val nodes = root.findAccessibilityNodeInfosByText(keyword)
             for (node in nodes) {
                 try {
-                    val clickTarget = findClickableParent(node, 10) ?: node
-                    if (clickTarget.isClickable || clickTarget.isEnabled) {
+                    val nodeText = node.text?.toString()?.trim() ?: ""
+
+                    // 排除导航栏的小"打卡"（只保留完整的"上班打卡"/"下班打卡"）
+                    if (nodeText == "打卡") {
+                        Log.d(tag = TAG, msg = "  [排除] 这是导航入口'打卡'，不是打卡按钮")
+                        continue
+                    }
+
+                    val target = findClickableParent(node, 10) ?: node
+                    if (target.isClickable || node.isClickable) {
+                        val clickTarget = if (node.isClickable) node else target
                         clickTarget.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                        hasClickedClockButton = true
-                        Log.i(TAG, "tryClickClockButton: 成功点击 [$actionLabel] 按钮 (text=$keyword)")
-                        handler.postDelayed({ onClockSuccess(actionLabel) }, successDelay)
+                        Log.i(TAG, "  ✓ 成功点击 [$actionLabel]! (text='$nodeText', keyword='$keyword')")
+                        return true
+                    } else {
+                        // 即使不可点击也尝试直接操作
+                        node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                        Log.i(TAG, "  ✓ 强制点击 [$actionLabel]! (text='$nodeText')")
                         return true
                     }
+                } catch (e: Exception) {
+                    Log.w(TAG, "  节点异常", e)
                 } finally {
                     node.recycle()
                 }
             }
         }
-
-        // 方式2：通过 contentDescription 遍历查找
-        if (tryClickByDescription(root, keywords, actionLabel)) return true
-
-        Log.d(TAG, "tryClickClockButton: 未找到打卡按钮，关键词=$keywords")
         return false
     }
 
     /**
-     * 通过 contentDescription 遍历节点树查找并点击
+     * 遍历整棵节点树，通过 contentDescription 或 partial text 匹配
      */
-    private fun tryClickByDescription(
+    private fun tryClickByTreeTraversal(
         root: AccessibilityNodeInfo,
         keywords: List<String>,
         actionLabel: String
     ): Boolean {
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
-        while (queue.isNotEmpty()) {
+        var visited = 0
+        val maxVisit = 500 // 防止无限遍历
+
+        while (queue.isNotEmpty() && visited < maxVisit) {
             val node = queue.removeFirst()
-            val desc = node.contentDescription?.toString() ?: ""
-            val text = node.text?.toString() ?: ""
-            if (keywords.any { desc.contains(it, true) || text.contains(it, true) }) {
-                val clickTarget = findClickableParent(node, 10) ?: node
-                if (clickTarget.isClickable) {
-                    clickTarget.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                    hasClickedClockButton = true
-                    Log.i(TAG, "tryClickByDescription: 成功点击 [$actionLabel] desc=$desc")
-                    handler.postDelayed({ onClockSuccess(actionLabel) }, successDelay)
-                    return true
+            visited++
+            try {
+                val desc = node.contentDescription?.toString()?.trim() ?: ""
+                val text = node.text?.toString()?.trim() ?: ""
+
+                // 检查是否匹配
+                val matchedKeyword = keywords.firstOrNull {
+                    desc.equals(it, ignoreCase = true) ||
+                            text.equals(it, ignoreCase = true) ||
+                            desc.contains(it, ignoreCase = true) && !desc.contains("打卡") && it != "打卡"
                 }
-            }
-            for (i in 0 until node.childCount) {
-                node.getChild(i)?.let { queue.add(it) }
+
+                if (matchedKeyword != null && text != "打卡") { // 排除纯"打卡"导航文字
+                    val target = findClickableParent(node, 10) ?: node
+                    if (target.isClickable) {
+                        target.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                        Log.i(TAG, "  ✓ 遍历命中: [$actionLabel] desc='$desc' text='$text'")
+                        return true
+                    }
+                }
+
+                // 添加子节点到队列
+                for (i in 0 until node.childCount) {
+                    node.getChild(i)?.let { queue.add(it) }
+                }
+            } catch (e: Exception) {
+                // 忽略单个节点的异常
             }
         }
         return false
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    //  工具方法
+    // ═══════════════════════════════════════════════════════════════
+
     /**
      * 向上查找可点击的父节点
-     * @param maxDepth 最大向上查找层数
      */
-    private fun findClickableParent(
-        node: AccessibilityNodeInfo,
-        maxDepth: Int
-    ): AccessibilityNodeInfo? {
+    private fun findClickableParent(node: AccessibilityNodeInfo, maxDepth: Int): AccessibilityNodeInfo? {
         var current: AccessibilityNodeInfo? = node.parent
         var depth = 0
         while (current != null && depth < maxDepth) {
@@ -339,10 +410,102 @@ class AutoClockAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * 打卡成功：发送通知 + 回桌面 + 重置状态
+     * 切换到新阶段（重置 retry 计数）
      */
+    private fun transitionTo(newPhase: Int) {
+        Log.i(TAG, "阶段切换: $currentPhase → $newPhase")
+        currentPhase = newPhase
+    }
+
+    /**
+     * 输出页面调试信息（用于排查找不到节点的问题）
+     */
+    private fun dumpPageInfo(root: AccessibilityNodeInfo) {
+        if (retryCount % 5 != 0) return // 每10秒输出一次，避免刷屏
+        val sb = StringBuilder()
+        sb.appendLine("=== 页面快照 (retry=$retryCount) ===")
+        sb.appendLine("package=${root.packageName}")
+        collectNodeTexts(root, sb, 0, 50) // 最多收集50个节点
+        Log.d(TAG, sb.toString())
+    }
+
+    private fun collectNodeTexts(node: AccessibilityNodeInfo, sb: StringBuilder, depth: Int, remaining: Int) {
+        if (remaining <= 0) return
+        val text = node.text?.toString()?.trim() ?: ""
+        val desc = node.contentDescription?.toString()?.trim() ?: ""
+        if (text.isNotEmpty() || desc.isNotEmpty()) {
+            val indent = "  ".repeat(depth.coerceAtMost(4))
+            sb.appendLine("${indent}'$text' (desc='$desc' click=${node.isClickable})")
+        }
+        for (i in 0 until node.childCount) {
+            node.getChild(i)?.let { collectNodeTexts(it, sb, depth + 1, remaining - 1) }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  外部调用接口 & 生命周期
+    // ═══════════════════════════════════════════════════════════════
+
+    /**
+     * 被 ClockAlarmReceiver / MainActivity 调用
+     * 开始一个新的打卡流程
+     */
+    fun onTaskStart() {
+        Log.i(TAG, "═══ onTaskStart ═══ action=$pendingAction task=$pendingTaskId")
+        currentPhase = PHASE_WAIT_APP
+        hasClickedSuccess = false
+        retryCount = 0
+        handler.removeCallbacks(pollRunnable)
+        handler.postDelayed(pollRunnable, initialDelay)
+    }
+
+    private var hasClickedSuccess = false
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        instance = this
+        Log.i(TAG, "onServiceConnected: 无障碍服务已连接")
+    }
+
+    override fun onUnbind(intent: Intent?): Boolean {
+        instance = null
+        handler.removeCallbacks(pollRunnable)
+        Log.i(TAG, "onUnbind: 服务断开")
+        return super.onUnbind(intent)
+    }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        event ?: return
+        if (pendingTaskId == -1L || pendingAction == null) return
+        if (hasClickedSuccess) return
+
+        val packageName = event.packageName?.toString() ?: return
+
+        // 只关心钉钉的事件
+        if (packageName != DINGTALK_PACKAGE &&
+            !packageName.contains("dingtalk", true) &&
+            !packageName.contains("rimet", true)
+        ) return
+
+        // 收到钉钉窗口变化事件时，提前触发一次轮询
+        when (event.eventType) {
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
+            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
+                Log.d(TAG, "onAccess: 收到钉钉事件 type=${event.eventType}, 提前轮询")
+                handler.removeCallbacks(pollRunnable)
+                handler.post(pollRunnable)
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  结果回调
+    // ═══════════════════════════════════════════════════════════════
+
     private fun onClockSuccess(actionLabel: String) {
-        Log.i(TAG, "onClockSuccess: [$actionLabel] 打卡成功!")
+        if (hasClickedSuccess) return
+        hasClickedSuccess = true
+        Log.i(TAG, "═══ 打卡成功! [$actionLabel] ═══")
         serviceScope.launch {
             NotificationUtil.sendClockResultNotification(
                 this@AutoClockAccessibilityService,
@@ -357,16 +520,13 @@ class AutoClockAccessibilityService : AccessibilityService() {
         resetState()
     }
 
-    /**
-     * 打卡失败：发送失败通知 + 回桌面 + 重置状态
-     */
     private fun onClockFail(reason: String) {
         val actionLabel = when (pendingAction) {
             ClockAction.CLOCK_IN -> "上班打卡"
             ClockAction.CLOCK_OUT -> "下班打卡"
             null -> "打卡"
         }
-        Log.w(TAG, "onClockFail: [$actionLabel] $reason")
+        Log.w(TAG, "═══ 打卡失败! [$actionLabel] $reason ═══")
         serviceScope.launch {
             NotificationUtil.sendClockResultNotification(
                 this@AutoClockAccessibilityService,
@@ -381,21 +541,17 @@ class AutoClockAccessibilityService : AccessibilityService() {
         resetState()
     }
 
-    /**
-     * 重置全部状态，准备下次执行
-     */
     fun resetState() {
         pendingTaskId = -1L
         pendingAction = null
-        hasClickedClockButton = false
-        hasNavigatedToWorkTab = false
-        hasNavigatedToAttendance = false
+        currentPhase = PHASE_WAIT_APP
+        hasClickedSuccess = false
         retryCount = 0
         handler.removeCallbacks(pollRunnable)
     }
 
     override fun onInterrupt() {
-        Log.w(TAG, "onInterrupt: 无障碍服务被中断")
+        Log.w(TAG, "onInterrupt: 服务被中断")
         resetState()
     }
 }
