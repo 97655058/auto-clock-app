@@ -13,7 +13,7 @@ import com.example.autoclock.databinding.ActivityMainBinding
 import com.example.autoclock.ui.edit.TaskEditActivity
 import com.example.autoclock.ui.permission.PermissionGuideActivity
 import com.example.autoclock.util.AccessibilityUtil
-import com.example.autoclock.worker.WorkManagerScheduler
+import com.example.autoclock.worker.AlarmScheduler
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.launch
 
@@ -49,9 +49,9 @@ class MainActivity : AppCompatActivity() {
             onToggle = { task, enabled ->
                 viewModel.setTaskEnabled(task.id, enabled)
                 if (enabled) {
-                    WorkManagerScheduler.scheduleTask(this, task.copy(enabled = true))
+                    AlarmScheduler.scheduleTask(this, task.copy(enabled = true))
                 } else {
-                    WorkManagerScheduler.cancelTask(this, task.id)
+                    AlarmScheduler.cancelTask(this, task.id)
                 }
             },
             onEdit = { task ->
@@ -67,13 +67,13 @@ class MainActivity : AppCompatActivity() {
                     .setMessage("确定删除「${task.name}」吗？")
                     .setPositiveButton("删除") { _, _ ->
                         viewModel.deleteTask(task)
-                        WorkManagerScheduler.cancelTask(this, task.id)
+                        AlarmScheduler.cancelTask(this, task.id)
                     }
                     .setNegativeButton("取消", null)
                     .show()
             },
             onRunNow = { task ->
-                WorkManagerScheduler.runTaskImmediately(this, task.id)
+                AlarmScheduler.runTaskImmediately(this, task)
                 showSnackbar("已触发「${task.name}」立即执行")
             }
         )
