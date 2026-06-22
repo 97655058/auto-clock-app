@@ -15,7 +15,7 @@ import com.example.autoclock.data.model.ClockAction
 import com.example.autoclock.data.model.TriggerType
 import com.example.autoclock.databinding.ActivityTaskEditBinding
 import com.example.autoclock.ui.main.MainActivity
-import com.example.autoclock.worker.WorkManagerScheduler
+import com.example.autoclock.worker.AlarmScheduler
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.launch
 
@@ -177,7 +177,7 @@ class TaskEditActivity : AppCompatActivity() {
                                     wifiSsid = s.wifiSsid,
                                     clockAction = s.clockAction
                                 )
-                                WorkManagerScheduler.scheduleTask(this@TaskEditActivity, task)
+                                AlarmScheduler.scheduleTask(this@TaskEditActivity, task)
                             }
                         }
                         finish()
