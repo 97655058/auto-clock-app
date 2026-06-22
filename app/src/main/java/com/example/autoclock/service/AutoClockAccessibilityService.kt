@@ -110,7 +110,7 @@ class AutoClockAccessibilityService : AccessibilityService() {
             }
 
             retryCount++
-            Log.d(TAG, "poll: #$retryCount/$maxRetries | phase=$currentPhase | action=$pendingAction")
+            Log.d(TAG, "poll: #$retryCount/$maxRetries | phase=$currentPhase | action=${pendingAction?.name}")
 
             val root = rootInActiveWindow
             if (root == null) {
@@ -318,7 +318,7 @@ class AutoClockAccessibilityService : AccessibilityService() {
 
                     // 排除导航栏的小"打卡"（只保留完整的"上班打卡"/"下班打卡"）
                     if (nodeText == "打卡") {
-                        Log.d(tag = TAG, msg = "  [排除] 这是导航入口'打卡'，不是打卡按钮")
+                        Log.d(TAG, "  [排除] 这是导航入口'打卡'，不是打卡按钮")
                         continue
                     }
 
@@ -451,7 +451,7 @@ class AutoClockAccessibilityService : AccessibilityService() {
      * 开始一个新的打卡流程
      */
     fun onTaskStart() {
-        Log.i(TAG, "═══ onTaskStart ═══ action=$pendingAction task=$pendingTaskId")
+        Log.i(TAG, "═══ onTaskStart ═══ action=${pendingAction?.name} task=$pendingTaskId")
         currentPhase = PHASE_WAIT_APP
         hasClickedSuccess = false
         retryCount = 0
