@@ -1,0 +1,2 @@
+-keep class com.example.autoclock.** { *; }
+-keepclassmembers class com.example.autoclock.data.model.** { *; }
