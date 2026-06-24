@@ -15,6 +15,7 @@ object NotificationUtil {
     const val CHANNEL_ID = "auto_clock_channel"
     const val CHANNEL_NAME = "自动打卡通知"
     private const val NOTIFICATION_ID_BASE = 1000
+    private const val NOTIFICATION_ID_UNLOCK = NOTIFICATION_ID_BASE + 99
 
     /**
      * 创建通知 Channel（需在 App 启动时调用）
@@ -30,6 +31,37 @@ object NotificationUtil {
         }
         val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         nm.createNotificationChannel(channel)
+    }
+
+    /**
+     * 发送解锁提示通知
+     */
+    fun sendUnlockHintNotification(context: Context, taskName: String) {
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+        val pendingIntent = PendingIntent.getActivity(
+            context,
+            0,
+            Intent(context, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = NotificationCompat.Builder(context, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentTitle("⏰ 自动打卡")
+            .setContentText("[$taskName] 已点亮屏幕，请上滑解锁后钉钉将自动启动")
+            .setStyle(NotificationCompat.BigTextStyle().bigText(
+                "[$taskName] 已点亮屏幕，请上滑解锁。\n钉钉将自动启动并执行打卡。"
+            ))
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
+            .setOnlyAlertOnce(true)
+            .build()
+
+        nm.notify(NOTIFICATION_ID_UNLOCK, notification)
     }
 
     /**
